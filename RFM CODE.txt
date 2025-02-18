@@ -1,0 +1,148 @@
+WITH 
+--funnel and monetary value section
+FNMV AS(
+    SELECT
+            DISTINCT CustomerID,
+            MAX(InvoiceDate_Day) AS Latest_Invoice_Day,
+            Country,
+            COUNT(InvoiceNo) AS Frequency,
+            ROUND(SUM(Quantity*UnitPrice),2) AS Monetary_Value
+            
+    FROM(      
+        SELECT 
+                InvoiceNo,
+                StockCode,
+                Description,
+                Quantity,
+                DATE_TRUNC(InvoiceDate, DAY) AS InvoiceDate_Day,
+                UnitPrice,
+                CustomerID,
+                Country
+        FROM 
+                `tc-da-1.turing_data_analytics.rfm`
+        WHERE 
+                DATE_TRUNC(InvoiceDate, DAY) BETWEEN '2010-12-01' AND '2011-12-01'
+                AND CustomerID IS NOT NULL
+    )
+    GROUP BY ALL
+),
+
+--recency section
+R AS
+(
+        SELECT
+                *,
+                DATE_DIFF(TIMESTAMP('2011-12-01'), Latest_Invoice_Day,DAY) AS Recency
+        FROM FNMV
+),
+--groupings based on quartiles
+GROUPINGS AS
+(
+        SELECT 
+                Z.*,
+                --groupings for quaters for m
+                Y.percentiles[OFFSET(25)] AS m25,
+                Y.percentiles[OFFSET(50)] AS m50,
+                Y.percentiles[OFFSET(75)] AS m75,
+                --groupings for quaters for f
+                X.percentiles[OFFSET(25)] AS f25,
+                X.percentiles[OFFSET(50)] AS f50,
+                X.percentiles[OFFSET(75)] AS f75,
+                --groupings for quaters for r
+                W.percentiles[OFFSET(25)] AS r25,
+                W.percentiles[OFFSET(50)] AS r50,
+                W.percentiles[OFFSET(75)] AS r75                
+        FROM 
+                R AS Z,
+                (
+                    SELECT 
+                        APPROX_QUANTILES(Monetary_Value, 100)percentiles 
+                    FROM 
+                        R
+                ) AS Y,
+                (
+                    SELECT
+                        APPROX_QUANTILES(Frequency, 100)percentiles
+                    FROM 
+                        R
+                ) AS X,
+                (
+                    SELECT
+                        APPROX_QUANTILES(Recency, 100)percentiles
+                    FROM R
+                ) AS W
+),
+--score assigning based on above groups
+SCORES AS(
+        SELECT
+        *,
+        CAST(ROUND((f_score + m_score) / 2, 0) AS INT64) AS fm_score
+        FROM
+        (
+        SELECT
+        *,
+        CASE 
+            WHEN Monetary_Value <= m25 THEN 1
+            WHEN Monetary_Value <= m50 AND Monetary_Value > m25 THEN 2 
+            WHEN Monetary_Value <= m75 AND Monetary_Value > m50 THEN 3 
+            WHEN Monetary_Value > m75 THEN 4 
+        END AS m_score,
+        CASE 
+            WHEN Frequency <= m25 THEN 1
+            WHEN Frequency <= m50 AND Frequency > m25 THEN 2 
+            WHEN Frequency <= m75 AND Frequency > m50 THEN 3 
+            WHEN Frequency > m75 THEN 4 
+        END AS f_score,
+        CASE 
+            WHEN Recency <= m25 THEN 4
+            WHEN Recency <= m50 AND Recency > m25 THEN 3
+            WHEN Recency <= m75 AND Recency > m50 THEN 2
+            WHEN Recency > m75 THEN  1
+        END AS r_score
+        FROM GROUPINGS
+        )
+),
+--customer segmentation based on above groups
+SEGMENTS AS
+(
+    SELECT 
+    *,
+        CASE WHEN (r_score = 5 AND fm_score = 5) 
+            OR (r_score = 5 AND fm_score = 4) 
+            OR (r_score = 4 AND fm_score = 5) 
+        THEN 'Best Customers'
+        WHEN (r_score = 5 AND fm_score =3) 
+            OR (r_score = 4 AND fm_score = 4)
+            OR (r_score = 3 AND fm_score = 5)
+            OR (r_score = 3 AND fm_score = 4)
+        THEN 'Loyal Customers'
+        WHEN (r_score = 5 AND fm_score = 2) 
+            OR (r_score = 4 AND fm_score = 2)
+            OR (r_score = 3 AND fm_score = 3)
+            OR (r_score = 4 AND fm_score = 3)
+        THEN 'Potential Loyalists'
+        WHEN r_score = 5 AND fm_score = 1 THEN 'Recent Customers'
+        WHEN (r_score = 4 AND fm_score = 1) 
+            OR (r_score = 3 AND fm_score = 1)
+        THEN 'Promising'
+        WHEN (r_score = 3 AND fm_score = 2) 
+            OR (r_score = 2 AND fm_score = 3)
+            OR (r_score = 2 AND fm_score = 2)
+        THEN 'Customers Needing Attention'
+        WHEN r_score = 2 AND fm_score = 1 THEN 'About to Sleep'
+        WHEN (r_score = 2 AND fm_score = 5) 
+            OR (r_score = 2 AND fm_score = 4)
+            OR (r_score = 1 AND fm_score = 3)
+        THEN 'At Risk'
+        WHEN (r_score = 1 AND fm_score = 5)
+            OR (r_score = 1 AND fm_score = 4)        
+        THEN 'Cant Lose Them'
+        WHEN r_score = 1 AND fm_score = 2 THEN 'Hibernating'
+        WHEN r_score = 1 AND fm_score = 1 THEN 'Lost Customers'
+        END AS rfm_segment 
+    FROM SCORES
+)
+--main query
+SELECT
+        *
+FROM SEGMENTS
